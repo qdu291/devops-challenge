@@ -7,9 +7,14 @@ Because this server is used to host Nginx Load Balancer server so below are some
 
 ## Nginx log
 - **Root cause:** access and error log `/var/log/nginx/access.log` or `/var/log/nginx/error.log` are too big
-- **Fix:** 
-1. If there is logrotate configured, check to make sure it's configured correctly, then trigger it to make sure it run as expectation and also to free disk
-2. If we need keep log for long term, we can setup Nginx to save log to remote log server or stream to logging platform such as `Grafana Loki`, `Elasticsearch`, `Cloudwatch`, etc.
+- **Fix:**
+1. Immediately fix
+```
+> /var/log/nginx/access.log
+> /var/log/nginx/error.log
+```
+2. If there is logrotate configured, check to make sure it's configured correctly, then trigger it to make sure it run as expectation and also to free disk
+3. If we need keep log for long term, we can setup Nginx to save log to remote log server or stream to logging platform such as `Grafana Loki`, `Elasticsearch`, `Cloudwatch`, etc.
 
 ## Nginx proxy cache
 - **Root cause:** Nginx is configured to cache response from upstream servers, but missing set `max_size` parameter then make `/var/cache/nginx` consume lot of disk space
