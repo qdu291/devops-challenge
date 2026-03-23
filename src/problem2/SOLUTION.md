@@ -54,7 +54,7 @@ EKS is chosen over ECS/Lambda because trading workloads have tight latency budge
 | **Wallet Service** | Balance reads; withdrawal requests with dual-approval; DynamoDB conditional writes for atomic deductions |
 | **Trade Service** | Consumes `fills` topic; records executed trades in Aurora; triggers balance updates |
 | **Market Data Service** | Consumes `fills` and `candles` topics; maintains in-process order book snapshot; pushes diffs to Redis Pub/Sub for WebSocket fan-out |
-| **Notification Service** | Consumes `fills`, `orders`, `balances`, and `alerts` Kafka topics; routes events to Amazon SNS for fan-out to SES (email), Pinpoint (SMS), and mobile push (APNs/FCM) |
+| **Matching Engine** | Consumes one dedicated Kafka partition per symbol; maintains in-memory order book; executes price-time priority matching; publishes fill events back to the `fills` topic. Runs as a `StatefulSet` — see below |
 
 ### Messaging — Amazon MSK (Kafka)
 
@@ -79,7 +79,7 @@ MSK Tiered Storage is enabled from launch: segments older than 24 hours move to 
 
 | Control | Implementation |
 |---|---|
-| **Network isolation** | ALB and NLB in public subnets; all databases, MSK, and Matching Engine in private subnets with no inbound internet route |
+| **Network isolation** | ALB and NLB in public subnets; all databases, MSK, and EKS workloads (including Matching Engine) in private subnets with no inbound internet route |
 | **Secrets management** | AWS Secrets Manager with automatic rotation; no secrets in env vars or container images |
 | **Encryption at rest** | AWS KMS CMKs for Aurora, DynamoDB, MSK, and S3 |
 | **Zero-trust IAM** | Each EKS pod has its own IAM role (IRSA) with least-privilege policies |
@@ -101,6 +101,54 @@ MSK Tiered Storage is enabled from launch: segments older than 24 hours move to 
 **Redis:** Cluster mode with 3 shards × 2 replicas across 3 AZs. ElastiCache Auto Scaling adjusts shard count at 65% CPU. At 1000× subscribers, replace Redis pub/sub fan-out with a dedicated MSK topic per symbol consumed directly by WebSocket pods.
 
 **MSK:** Partition count is the primary lever — topics keyed by `symbol` allow consumer parallelism to scale with partition count. MSK rolling broker upgrades are zero-downtime. At 100× volume, enable tiered storage and increase partition counts; at 1000×, migrate to MSK Serverless.
+
+### Request Latency Profile
+
+Three critical flows with per-hop latency estimates for a client in the same region (Singapore).
+
+#### Flow 1 — Order Submission (REST POST /api/v1/orders)
+
+| # | Hop | p50 | p99 | Notes |
+|---|---|---|---|---|
+| 1 | Client → CloudFront edge | ~5ms | ~15ms | Regional edge PoP; international clients add 50–150ms |
+| 2 | CloudFront → NLB | ~1ms | ~2ms | AWS private backbone; not public internet |
+| 3 | NLB pass-through | < 1ms | < 1ms | Stateless L4; no processing overhead |
+| 4 | ALB WAF evaluation | ~1ms | ~2ms | Managed rule groups; hardware-accelerated at ALB |
+| 5 | ALB JWT validation | ~1ms | ~2ms | Cognito JWKS public key cached at ALB; local signature verify only |
+| 6 | ALB → Order Service pod | < 1ms | < 1ms | Pod IP in same VPC; no NAT hop |
+| 7 | Order Service (validate + balance pre-check) | ~2ms | ~5ms | DynamoDB read for balance; idempotency key check |
+| 8 | DynamoDB write (order record) | ~3ms | ~8ms | Conditional write; single-digit ms guaranteed |
+| 9 | MSK produce (`orders` topic) | ~5ms | ~10ms | `linger.ms=5` batching; `acks=all` durability |
+| 10 | Response back to client (reverse path) | ~8ms | ~20ms | ALB → NLB → CloudFront → client |
+| | **Total** | **~27ms** | **~65ms** | SLO target: p99 < 50ms (achievable with same-region clients) |
+
+#### Flow 2 — Fill Notification to Client (WebSocket push after order matched)
+
+| # | Hop | p50 | p99 | Notes |
+|---|---|---|---|---|
+| 1 | Matching Engine processes fill | < 0.1ms | < 0.5ms | In-memory order book; single-threaded |
+| 2 | ME → MSK `fills` topic | ~1ms | ~3ms | Kafka producer; no linger (ME uses `linger.ms=0`) |
+| 3 | MSK → Market Data Service | ~2ms | ~5ms | Consumer fetch; dedicated partition per symbol |
+| 4 | Market Data Service → Redis PUBLISH | < 1ms | ~1ms | In-VPC; sub-millisecond Redis write |
+| 5 | Redis → WebSocket pod (SUBSCRIBE deliver) | < 1ms | ~1ms | Pub/sub channel; same-shard delivery |
+| 6 | WebSocket pod → Client | ~5ms | ~15ms | Network to client; persistent WS connection |
+| | **Total (server-side only, steps 1–5)** | **~5ms** | **~10ms** | |
+| | **Total (end-to-end incl. network)** | **~10ms** | **~25ms** | SLO target: p99 < 100ms |
+
+#### Flow 3 — Read API (GET /api/v1/trades — trade history)
+
+| # | Hop | Cached (CloudFront) | Cache miss |
+|---|---|---|---|
+| 1 | Client → CloudFront | ~5ms | ~5ms |
+| 2 | CloudFront serves response | ~0ms | — |
+| 3 | CloudFront → NLB → ALB → Trade Service | — | ~5ms |
+| 4 | Aurora read replica (via RDS Proxy) | — | ~3ms |
+| 5 | Response back | — | ~10ms |
+| | **Total** | **~5ms** | **~23ms** |
+
+> Public read endpoints (ticker price, order book snapshot, recent trades) are cached at CloudFront with a short TTL (1–5s), so the vast majority of read traffic never reaches the origin.
+
+---
 
 ### CI/CD
 
@@ -125,7 +173,7 @@ GitHub Actions → Build & push Docker image to ECR
 | MSK | 3 brokers, one per AZ; `min.insync.replicas=2` |
 | ElastiCache Redis | Cluster mode: 3 shards × 2 replicas, one replica per AZ |
 | DynamoDB | Fully managed; Global Tables replicate to secondary region |
-| Matching Engine | Active/Standby across 2 AZs; leader election via DynamoDB |
+| Matching Engine | StatefulSet (2 replicas across 2 AZs); leader election via Kubernetes `Lease`; WAL on EBS `io2` |
 
 ### (Optional) Multi-Region DR (Secondary — Tokyo `ap-northeast-1`)
 
@@ -137,7 +185,7 @@ GitHub Actions → Build & push Docker image to ECR
 | DynamoDB | Global Tables — active-active; conditional writes prevent conflicts | < 1s | 0 (already active) |
 | MSK Kafka | MirrorMaker 2 continuously mirrors all topics; offset translation preserved for consumer resume | < 5s | < 1 min |
 | EKS services | Cluster kept at minimum nodes, Deployments at 0 replicas; ArgoCD scales up on `DR_ACTIVE=true` Git flag; Karpenter provisions nodes in ~60s as pods become `Pending` | N/A (stateless) | < 2 min |
-| Matching Engine | Standby EC2 in Tokyo consumes replicated topic to keep order book warm; leader election on failover | 0 (warm) | < 1 min |
+| Matching Engine | StatefulSet in Tokyo EKS scales up with the cluster; consumes MM2-replicated topic to keep order book warm; Kubernetes `Lease` leader election on failover | 0 (warm) | < 1 min |
 | Redis | Not replicated — rebuilt from Aurora/MSK in < 30s (cache is ephemeral) | N/A | < 30s |
 | S3 | Cross-Region Replication to Tokyo | < 15 min | 0 (already synced) |
 | **Overall platform** | Route 53 health check → DNS failover → scale-up | **< 30s** | **< 5 min** |
